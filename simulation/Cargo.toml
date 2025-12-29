@@ -1,11 +1,19 @@
 [package]
-name = "fair-poa-simulation"
+name = "fair-simulation"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
-name = "fair-poa"
-path = "ipfe_poa.rs"
+name = "poa"
+path = "src/bin/poa.rs"
+
+[[bin]]
+name = "cascade"
+path = "src/bin/cascade.rs"
 
 [dependencies]
 rand = "0.8"
+rand_distr = "0.4"
