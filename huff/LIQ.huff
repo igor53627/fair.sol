@@ -1,0 +1,673 @@
+/// @title LIQ - Gas-Optimized Flash Mint Protocol
+/// @notice Wrapped USDC with ERC-3156 flash lending (free flash mints)
+/// @dev Target: <15,000 gas for flash mint operation (excluding callback)
+/// SPDX-License-Identifier: MIT
+
+// ============================================================================
+// IMPORTS & CONSTANTS
+// ============================================================================
+
+// USDC address stored as immutable (constructor arg)
+#define constant USDC = 0x0000000000000000000000000000000000000000
+
+// Storage slots - packed for efficiency
+// Slot 0: totalSupply
+// Slot 1+: balanceOf mapping base (keccak256(addr, 1))
+// Slot 2+: allowance mapping base (keccak256(spender, keccak256(owner, 2)))
+#define constant TOTAL_SUPPLY_SLOT = 0x00
+#define constant BALANCE_SLOT = 0x01
+#define constant ALLOWANCE_SLOT = 0x02
+
+// ERC-3156 callback return value: keccak256("ERC3156FlashBorrower.onFlashLoan")
+#define constant CALLBACK_SUCCESS = 0x439148f0bbc682ca079e46d6e2c2f0c1e3b820f1a291b069d8882abf8cf18dd9
+
+// Function selectors (4 bytes)
+#define constant SIG_NAME = 0x06fdde03
+#define constant SIG_SYMBOL = 0x95d89b41
+#define constant SIG_DECIMALS = 0x313ce567
+#define constant SIG_TOTAL_SUPPLY = 0x18160ddd
+#define constant SIG_BALANCE_OF = 0x70a08231
+#define constant SIG_TRANSFER = 0xa9059cbb
+#define constant SIG_TRANSFER_FROM = 0x23b872dd
+#define constant SIG_APPROVE = 0x095ea7b3
+#define constant SIG_ALLOWANCE = 0xdd62ed3e
+#define constant SIG_MINT = 0xa0712d68
+#define constant SIG_REDEEM = 0xdb006a75
+#define constant SIG_USDC = 0x3e413bee
+#define constant SIG_MAX_FLASH_LOAN = 0x613255ab
+#define constant SIG_FLASH_FEE = 0xd9d98ce4
+#define constant SIG_FLASH_LOAN = 0x5cffe9de
+
+// USDC transfer selector
+#define constant SIG_ERC20_TRANSFER = 0xa9059cbb00000000000000000000000000000000000000000000000000000000
+#define constant SIG_ERC20_TRANSFER_FROM = 0x23b872dd00000000000000000000000000000000000000000000000000000000
+
+// Error selectors
+#define constant ERR_INSUFFICIENT_BALANCE = 0xf4d678b8
+#define constant ERR_INSUFFICIENT_ALLOWANCE = 0x13be252b
+#define constant ERR_INVALID_TOKEN = 0xc1ab6dc1
+#define constant ERR_CALLBACK_FAILED = 0x08c379a0
+
+// ============================================================================
+// MEMORY LAYOUT (transient during calls)
+// ============================================================================
+// 0x00-0x20: scratch space 1
+// 0x20-0x40: scratch space 2
+// 0x40-0x60: scratch space 3
+// 0x60-0x80: free memory pointer (we don't use this, static layout)
+// 0x80+: calldata for external calls
+
+// ============================================================================
+// HELPER MACROS
+// ============================================================================
+
+/// @notice Push 0 using RETURNDATASIZE (2 gas vs 3 gas for PUSH1 0)
+#define macro ZERO() = takes(0) returns(1) {
+    returndatasize                      // [0] - 2 gas, saves 1 gas per use
+}
+
+/// @notice Compute balance slot for address
+/// @dev keccak256(abi.encode(addr, BALANCE_SLOT))
+#define macro BALANCE_SLOT_OF() = takes(1) returns(1) {
+    // Input: [addr]
+    ZERO() mstore                       // [] - store addr at 0x00
+    [BALANCE_SLOT] 0x20 mstore          // [] - store slot at 0x20
+    0x40 ZERO() sha3                    // [slot]
+}
+
+/// @notice Compute allowance slot for owner,spender
+/// @dev keccak256(abi.encode(spender, keccak256(abi.encode(owner, ALLOWANCE_SLOT))))
+#define macro ALLOWANCE_SLOT_OF() = takes(2) returns(1) {
+    // Input: [owner, spender]
+    swap1                               // [spender, owner]
+    ZERO() mstore                       // [spender] - owner at 0x00
+    [ALLOWANCE_SLOT] 0x20 mstore        // [spender] - slot at 0x20
+    0x40 ZERO() sha3                    // [spender, inner_slot]
+    ZERO() mstore                       // [] - spender at 0x00
+    0x20 mstore                         // [] - inner_slot at 0x20
+    0x40 ZERO() sha3                    // [allowance_slot]
+}
+
+/// @notice Revert with no data (most gas efficient)
+#define macro REVERT_ZERO() = takes(0) returns(0) {
+    ZERO() ZERO() revert
+}
+
+/// @notice Return true (0x01)
+#define macro RETURN_TRUE() = takes(0) returns(0) {
+    0x01 ZERO() mstore
+    0x20 ZERO() return
+}
+
+/// @notice Return a single uint256 from stack
+#define macro RETURN_UINT() = takes(1) returns(0) {
+    // Input: [value]
+    ZERO() mstore                       // [] - store value at 0x00
+    0x20 ZERO() return                  // return 32 bytes
+}
+
+// ============================================================================
+// ERC20 VIEW FUNCTIONS
+// ============================================================================
+
+/// @notice Returns token name "LIQ"
+#define macro NAME() = takes(0) returns(0) {
+    // Return ABI-encoded string "LIQ"
+    // offset: 0x20, length: 0x03, data: "LIQ"
+    0x20 ZERO() mstore                  // offset = 32
+    0x03 0x20 mstore                    // length = 3
+    0x4c49510000000000000000000000000000000000000000000000000000000000 
+    0x40 mstore                         // "LIQ" padded
+    0x60 ZERO() return
+}
+
+/// @notice Returns token symbol "LIQ"
+#define macro SYMBOL() = takes(0) returns(0) {
+    // Same as name for LIQ
+    0x20 ZERO() mstore
+    0x03 0x20 mstore
+    0x4c49510000000000000000000000000000000000000000000000000000000000
+    0x40 mstore
+    0x60 ZERO() return
+}
+
+/// @notice Returns decimals (6, matching USDC)
+#define macro DECIMALS() = takes(0) returns(0) {
+    0x06 RETURN_UINT()
+}
+
+/// @notice Returns total supply
+#define macro TOTAL_SUPPLY() = takes(0) returns(0) {
+    [TOTAL_SUPPLY_SLOT] sload           // [totalSupply]
+    RETURN_UINT()
+}
+
+/// @notice Returns balance of address
+/// @dev Selector: 0x70a08231
+#define macro BALANCE_OF() = takes(0) returns(0) {
+    0x04 calldataload                   // [addr]
+    BALANCE_SLOT_OF()                   // [slot]
+    sload                               // [balance]
+    RETURN_UINT()
+}
+
+/// @notice Returns allowance(owner, spender)
+/// @dev Selector: 0xdd62ed3e
+#define macro ALLOWANCE() = takes(0) returns(0) {
+    0x04 calldataload                   // [owner]
+    0x24 calldataload                   // [owner, spender]
+    ALLOWANCE_SLOT_OF()                 // [slot]
+    sload                               // [allowance]
+    RETURN_UINT()
+}
+
+// ============================================================================
+// ERC20 STATE-CHANGING FUNCTIONS
+// ============================================================================
+
+/// @notice Internal: update balance, reverts on underflow
+/// @dev Stack: [addr, delta, isAdd] where isAdd=1 for add, 0 for sub
+#define macro UPDATE_BALANCE() = takes(3) returns(0) {
+    // Input: [addr, delta, isAdd]
+    swap2                               // [isAdd, delta, addr]
+    swap1                               // [delta, isAdd, addr]
+    dup3                                // [addr, delta, isAdd, addr]
+    BALANCE_SLOT_OF()                   // [slot, delta, isAdd, addr]
+    dup1 sload                          // [balance, slot, delta, isAdd, addr]
+    
+    // Check isAdd flag
+    swap3                               // [isAdd, slot, delta, balance, addr]
+    add_branch jumpi                    // [slot, delta, balance, addr]
+    
+    // Subtract path
+    swap1                               // [delta, slot, balance, addr]
+    swap2                               // [balance, slot, delta, addr]
+    dup1                                // [balance, balance, slot, delta, addr]
+    swap3                               // [delta, balance, slot, balance, addr]
+    gt sub_underflow jumpi              // [balance, slot, delta, addr] - revert if delta > balance
+    swap2                               // [delta, slot, balance, addr]
+    swap1                               // [slot, delta, balance, addr]
+    swap2                               // [balance, delta, slot, addr]
+    sub                                 // [new_balance, slot, addr]
+    swap1 sstore                        // [addr]
+    pop                                 // []
+    done jump
+
+    add_branch:
+        // Add path: [slot, delta, balance, addr]
+        swap2                           // [balance, delta, slot, addr]
+        add                             // [new_balance, slot, addr]
+        swap1 sstore                    // [addr]
+        pop                             // []
+        done jump
+
+    sub_underflow:
+        REVERT_ZERO()
+
+    done:
+}
+
+/// @notice transfer(to, amount)
+#define macro TRANSFER() = takes(0) returns(0) {
+    0x24 calldataload                   // [amount]
+    0x04 calldataload                   // [amount, to]
+    
+    // Decrease sender balance
+    caller                              // [sender, amount, to]
+    dup2                                // [amount, sender, amount, to]
+    ZERO()                              // [0, amount, sender, amount, to] - isAdd=0 (subtract)
+    UPDATE_BALANCE()                    // [amount, to]
+    
+    // Increase recipient balance
+    swap1                               // [to, amount]
+    dup2                                // [amount, to, amount]
+    0x01                                // [1, amount, to, amount] - isAdd=1 (add)
+    UPDATE_BALANCE()                    // [amount]
+    pop
+    
+    // Emit Transfer event
+    // TODO: Add event emission for compliance
+    
+    RETURN_TRUE()
+}
+
+/// @notice approve(spender, amount)
+#define macro APPROVE() = takes(0) returns(0) {
+    0x24 calldataload                   // [amount]
+    caller                              // [owner, amount]
+    0x04 calldataload                   // [owner, spender, amount]
+    ALLOWANCE_SLOT_OF()                 // [slot, amount]
+    sstore                              // []
+    
+    // Emit Approval event
+    // TODO: Add event emission for compliance
+    
+    RETURN_TRUE()
+}
+
+/// @notice transferFrom(from, to, amount)
+#define macro TRANSFER_FROM() = takes(0) returns(0) {
+    0x44 calldataload                   // [amount]
+    0x04 calldataload                   // [amount, from]
+    0x24 calldataload                   // [amount, from, to]
+    
+    // Check and update allowance (skip if caller == from or allowance == max)
+    dup2                                // [from, amount, from, to]
+    caller eq skip_allowance jumpi      // [amount, from, to]
+    
+    // Get allowance
+    dup2                                // [from, amount, from, to]
+    caller                              // [spender, from, amount, from, to]
+    ALLOWANCE_SLOT_OF()                 // [slot, amount, from, to]
+    dup1 sload                          // [allowance, slot, amount, from, to]
+    
+    // Check if max uint256 (infinite approval)
+    dup1                                // [allowance, allowance, slot, amount, from, to]
+    0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    eq skip_allowance_update jumpi      // [allowance, slot, amount, from, to]
+    
+    // Check sufficient allowance
+    dup3                                // [amount, allowance, slot, amount, from, to]
+    gt insufficient_allowance jumpi     // [allowance, slot, amount, from, to]
+    
+    // Decrease allowance
+    dup3                                // [amount, allowance, slot, amount, from, to]
+    swap1 sub                           // [new_allowance, slot, amount, from, to]
+    swap1 sstore                        // [amount, from, to]
+    update_balances jump
+
+    skip_allowance_update:
+        pop pop                         // [amount, from, to]
+        update_balances jump
+
+    skip_allowance:
+        // [amount, from, to]
+
+    update_balances:
+        // Decrease from balance
+        dup2                            // [from, amount, from, to]
+        dup2                            // [amount, from, amount, from, to]
+        ZERO()                          // [0, amount, from, amount, from, to]
+        UPDATE_BALANCE()                // [amount, from, to]
+        
+        // Increase to balance
+        swap2                           // [to, from, amount]
+        swap1 pop                       // [to, amount]
+        dup2                            // [amount, to, amount]
+        0x01                            // [1, amount, to, amount]
+        UPDATE_BALANCE()                // [amount]
+        pop
+        
+        RETURN_TRUE()
+
+    insufficient_allowance:
+        REVERT_ZERO()
+}
+
+// ============================================================================
+// LIQ-SPECIFIC FUNCTIONS (USDC WRAP/UNWRAP)
+// ============================================================================
+
+/// @notice Returns USDC address
+#define macro USDC_ADDRESS() = takes(0) returns(0) {
+    [USDC] RETURN_UINT()
+}
+
+/// @notice mint(amount) - deposit USDC, receive LIQ
+#define macro MINT() = takes(0) returns(0) {
+    0x04 calldataload                   // [amount]
+    
+    // transferFrom(msg.sender, address(this), amount) on USDC
+    [SIG_ERC20_TRANSFER_FROM] ZERO() mstore  // selector at 0x00
+    caller 0x04 mstore                  // from = msg.sender
+    address 0x24 mstore                 // to = address(this)
+    dup1 0x44 mstore                    // amount
+    
+    // Call USDC.transferFrom
+    0x20                                // [retSize, amount]
+    ZERO()                              // [retOffset, retSize, amount]
+    0x64                                // [argSize, retOffset, retSize, amount]
+    ZERO()                              // [argOffset, argSize, retOffset, retSize, amount]
+    ZERO()                              // [value, argOffset, argSize, retOffset, retSize, amount]
+    [USDC]                              // [to, value, argOffset, argSize, retOffset, retSize, amount]
+    gas                                 // [gas, to, value, argOffset, argSize, retOffset, retSize, amount]
+    call                                // [success, amount]
+    
+    iszero usdc_transfer_failed jumpi   // [amount]
+    
+    // Mint LIQ to caller
+    dup1                                // [amount, amount]
+    caller                              // [caller, amount, amount]
+    _MINT()                             // [amount]
+    pop
+    
+    RETURN_TRUE()
+
+    usdc_transfer_failed:
+        REVERT_ZERO()
+}
+
+/// @notice redeem(amount) - burn LIQ, receive USDC
+#define macro REDEEM() = takes(0) returns(0) {
+    0x04 calldataload                   // [amount]
+    
+    // Burn LIQ from caller
+    dup1                                // [amount, amount]
+    caller                              // [caller, amount, amount]
+    _BURN()                             // [amount]
+    
+    // transfer(msg.sender, amount) on USDC
+    [SIG_ERC20_TRANSFER] ZERO() mstore  // selector at 0x00
+    caller 0x04 mstore                  // to = msg.sender
+    dup1 0x24 mstore                    // amount
+    
+    // Call USDC.transfer
+    0x20                                // [retSize, amount]
+    ZERO()                              // [retOffset, retSize, amount]
+    0x44                                // [argSize, retOffset, retSize, amount]
+    ZERO()                              // [argOffset, argSize, retOffset, retSize, amount]
+    ZERO()                              // [value, argOffset, argSize, retOffset, retSize, amount]
+    [USDC]                              // [to, value, argOffset, argSize, retOffset, retSize, amount]
+    gas                                 // [gas, ...]
+    call                                // [success, amount]
+    
+    iszero usdc_transfer_failed jumpi   // [amount]
+    pop
+    
+    RETURN_TRUE()
+
+    usdc_transfer_failed:
+        REVERT_ZERO()
+}
+
+// ============================================================================
+// INTERNAL MINT/BURN (OPTIMIZED FOR FLASH LOANS)
+// ============================================================================
+
+/// @notice Internal mint - increases supply and balance
+/// @dev Stack: [receiver, amount] -> []
+/// @dev Gas optimized: single SLOAD+SSTORE per storage slot
+#define macro _MINT() = takes(2) returns(0) {
+    // Input: [receiver, amount]
+    
+    // Update totalSupply (slot 0)
+    [TOTAL_SUPPLY_SLOT] sload           // [supply, receiver, amount]
+    dup3 add                            // [newSupply, receiver, amount]
+    [TOTAL_SUPPLY_SLOT] sstore          // [receiver, amount]
+    
+    // Update receiver balance
+    dup1 BALANCE_SLOT_OF()              // [slot, receiver, amount]
+    dup1 sload                          // [balance, slot, receiver, amount]
+    dup4 add                            // [newBalance, slot, receiver, amount]
+    swap1 sstore                        // [receiver, amount]
+    pop pop                             // []
+}
+
+/// @notice Internal burn - decreases supply and balance (reverts on underflow)
+/// @dev Stack: [receiver, amount] -> []
+/// @dev Gas optimized: minimal checks, single SLOAD+SSTORE per slot
+#define macro _BURN() = takes(2) returns(0) {
+    // Input: [receiver, amount]
+    
+    // Update receiver balance first (more likely to fail)
+    dup1 BALANCE_SLOT_OF()              // [slot, receiver, amount]
+    dup1 sload                          // [balance, slot, receiver, amount]
+    dup4                                // [amount, balance, slot, receiver, amount]
+    dup2 lt burn_underflow jumpi        // [balance, slot, receiver, amount] - revert if balance < amount
+    dup4 swap1 sub                      // [newBalance, slot, receiver, amount]
+    swap1 sstore                        // [receiver, amount]
+    
+    // Update totalSupply
+    [TOTAL_SUPPLY_SLOT] sload           // [supply, receiver, amount]
+    dup3 swap1 sub                      // [newSupply, receiver, amount]
+    [TOTAL_SUPPLY_SLOT] sstore          // [receiver, amount]
+    pop pop                             // []
+    burn_done jump
+
+    burn_underflow:
+        REVERT_ZERO()
+
+    burn_done:
+}
+
+// ============================================================================
+// ERC-3156 FLASH LENDER INTERFACE
+// ============================================================================
+
+/// @notice maxFlashLoan(token) - returns max if token==this, else 0
+#define macro MAX_FLASH_LOAN() = takes(0) returns(0) {
+    0x04 calldataload                   // [token]
+    address eq is_liq jumpi             // []
+    
+    // Not LIQ token - return 0
+    ZERO() RETURN_UINT()
+
+    is_liq:
+        // Return type(uint256).max
+        0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+        RETURN_UINT()
+}
+
+/// @notice flashFee(token, amount) - returns 0 if token==this, else reverts
+#define macro FLASH_FEE() = takes(0) returns(0) {
+    0x04 calldataload                   // [token]
+    address eq is_liq jumpi             // []
+    
+    // Not LIQ token - revert
+    REVERT_ZERO()
+
+    is_liq:
+        // Free flash loans!
+        ZERO() RETURN_UINT()
+}
+
+/// @notice flashLoan(receiver, token, amount, data) - THE MAIN EVENT
+/// @dev Simplified for stack safety
+#define macro FLASH_LOAN() = takes(0) returns(0) {
+    // Validate token == address(this)
+    0x24 calldataload                   // [token]
+    address eq valid_token jumpi        // []
+    REVERT_ZERO()
+
+    valid_token:
+    // Load receiver and amount
+    0x04 calldataload                   // [receiver]
+    0x44 calldataload                   // [amount, receiver]
+    
+    // ===== MINT to receiver =====
+    dup1 dup3                           // [receiver, amount, amount, receiver]
+    _MINT()                             // [amount, receiver]
+    
+    // Store amount and receiver in memory for later
+    dup1 0x00 mstore                    // amount at 0x00
+    dup2 0x20 mstore                    // receiver at 0x20
+    pop pop                             // []
+    
+    // ===== Prepare callback at 0x80 =====
+    // onFlashLoan(address initiator, address token, uint256 amount, uint256 fee, bytes data)
+    0x23e30c8b00000000000000000000000000000000000000000000000000000000
+    0x80 mstore                         // selector
+    caller 0x84 mstore                  // initiator
+    address 0xa4 mstore                 // token
+    0x00 mload 0xc4 mstore              // amount
+    ZERO() 0xe4 mstore                  // fee = 0
+    0x80 0x104 mstore                   // data offset (0x80 from start of params)
+    
+    // Copy data length and bytes
+    0x64 calldataload 0x04 add          // [dataLoc]
+    dup1 calldataload                   // [dataLen, dataLoc]
+    dup1 0x124 mstore                   // store length
+    // calldatacopy(dest, offset, size)
+    dup1                                // [dataLen, dataLen, dataLoc]
+    swap2                               // [dataLoc, dataLen, dataLen]
+    0x20 add                            // [dataSrc, dataLen, dataLen]
+    0x144                               // [dest, dataSrc, dataLen, dataLen]
+    calldatacopy                        // [dataLen]
+    
+    // callSize = 0xa4 + dataLen
+    0xa4 add                            // [callSize]
+    
+    // ===== CALL =====
+    // CALL(gas, addr, value, argsOffset, argsSize, retOffset, retSize)
+    0x20 mload                          // [receiver, callSize]
+    gas                                 // [gas, receiver, callSize]
+    swap1                               // [receiver, gas, callSize]
+    ZERO()                              // [0, receiver, gas, callSize]
+    0x80                                // [0x80, 0, receiver, gas, callSize]
+    dup5                                // [callSize, 0x80, 0, receiver, gas, callSize]
+    ZERO()                              // [0, callSize, 0x80, 0, receiver, gas, callSize]
+    0x20                                // [0x20, 0, callSize, 0x80, 0, receiver, gas, callSize]
+    // Need to rearrange for: gas, addr, value, argsOffset, argsSize, retOffset, retSize
+    // Current: [0x20, 0, callSize, 0x80, 0, receiver, gas, callSize]
+    
+    // Simplify: use direct stack
+    pop pop pop pop pop pop pop pop     // Clear all
+    
+    // Direct approach with minimal stack
+    0x20 mload                          // [receiver]
+    0x64 calldataload 0x04 add calldataload 0xa4 add  // [callSize, receiver]
+    
+    // Store call args to avoid stack depth
+    0x20                                // [32, callSize, receiver] - retSize
+    ZERO()                              // [0, 32, callSize, receiver] - retOffset
+    dup3                                // [callSize, 0, 32, callSize, receiver] - argsSize
+    0x80                                // [0x80, callSize, 0, 32, callSize, receiver] - argsOffset
+    ZERO()                              // [0, 0x80, callSize, 0, 32, callSize, receiver] - value
+    dup7                                // [receiver, 0, 0x80, callSize, 0, 32, callSize, receiver] - addr
+    gas                                 // [gas, receiver, 0, 0x80, callSize, 0, 32, callSize, receiver]
+    call                                // [success, callSize, receiver]
+    
+    // Check call succeeded
+    iszero callback_failed jumpi        // [callSize, receiver]
+    pop pop                             // []
+    
+    // ===== Verify return value =====
+    ZERO() mload                        // [returnValue] - but we stored amount there!
+    
+    // Need to reload from memory... but we overwrote it. Read from calldata instead.
+    pop                                 // []
+    0x40 mload                          // [returnData from call at offset 0]
+    [CALLBACK_SUCCESS]                  // [expected, returnValue]
+    eq callback_ok jumpi                // []
+    
+    callback_failed:
+        REVERT_ZERO()
+    
+    callback_ok:
+    // ===== BURN from receiver =====
+    0x20 mload                          // [receiver]
+    0x44 calldataload                   // [amount, receiver]
+    _BURN()                             // []
+    
+    RETURN_TRUE()
+}
+
+// ============================================================================
+// FUNCTION DISPATCHER (LINEAR SEARCH)
+// ============================================================================
+
+/// @notice Main entry point - routes to correct function
+/// @dev Uses simple linear search for reliable dispatch
+#define macro MAIN() = takes(0) returns(0) {
+    // Get function selector (first 4 bytes)
+    0x00 calldataload 0xe0 shr          // [selector]
+    
+    // ERC20 view functions
+    dup1 0x06fdde03 eq is_name jumpi           // name()
+    dup1 0x95d89b41 eq is_symbol jumpi         // symbol()
+    dup1 0x313ce567 eq is_decimals jumpi       // decimals()
+    dup1 0x18160ddd eq is_total_supply jumpi   // totalSupply()
+    dup1 0x70a08231 eq is_balance_of jumpi     // balanceOf(address)
+    dup1 0xdd62ed3e eq is_allowance jumpi      // allowance(address,address)
+    
+    // ERC20 state-changing functions
+    dup1 0xa9059cbb eq is_transfer jumpi       // transfer(address,uint256)
+    dup1 0x23b872dd eq is_transfer_from jumpi  // transferFrom(address,address,uint256)
+    dup1 0x095ea7b3 eq is_approve jumpi        // approve(address,uint256)
+    
+    // USDC wrapper functions
+    dup1 0xa0712d68 eq is_mint jumpi           // mint(uint256)
+    dup1 0xdb006a75 eq is_redeem jumpi         // redeem(uint256)
+    dup1 0x3e413bee eq is_usdc jumpi           // usdc()
+    
+    // ERC-3156 flash lender functions
+    dup1 0x613255ab eq is_max_flash_loan jumpi // maxFlashLoan(address)
+    dup1 0xd9d98ce4 eq is_flash_fee jumpi      // flashFee(address,uint256)
+    dup1 0x5cffe9de eq is_flash_loan jumpi     // flashLoan(address,address,uint256,bytes)
+    
+    // Fallback - revert
+    0x00 0x00 revert
+    
+    is_name:
+        pop
+        NAME()
+    
+    is_symbol:
+        pop
+        SYMBOL()
+    
+    is_decimals:
+        pop
+        DECIMALS()
+    
+    is_total_supply:
+        pop
+        TOTAL_SUPPLY()
+    
+    is_balance_of:
+        pop
+        BALANCE_OF()
+    
+    is_allowance:
+        pop
+        ALLOWANCE()
+    
+    is_transfer:
+        pop
+        TRANSFER()
+    
+    is_transfer_from:
+        pop
+        TRANSFER_FROM()
+    
+    is_approve:
+        pop
+        APPROVE()
+    
+    is_mint:
+        pop
+        MINT()
+    
+    is_redeem:
+        pop
+        REDEEM()
+    
+    is_usdc:
+        pop
+        USDC_ADDRESS()
+    
+    is_max_flash_loan:
+        pop
+        MAX_FLASH_LOAN()
+    
+    is_flash_fee:
+        pop
+        FLASH_FEE()
+    
+    is_flash_loan:
+        pop
+        FLASH_LOAN()
+}
+
+// ============================================================================
+// CONSTRUCTOR
+// ============================================================================
+
+/// @notice Constructor - stores USDC address as immutable
+/// @dev USDC address is appended to bytecode, read via CODECOPY
+#define macro CONSTRUCTOR() = takes(0) returns(0) {
+    // The USDC address is passed as constructor arg
+    // In Huff, we handle this by reading from the end of init code
+    // For simplicity, USDC is defined as a constant above
+    // In production, use huffc --constructor-args to set USDC
+}

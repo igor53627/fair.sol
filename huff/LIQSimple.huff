@@ -1,0 +1,30 @@
+/// @title LIQSimple - Minimal test of function dispatch
+/// SPDX-License-Identifier: MIT
+
+#define macro MAIN() = takes(0) returns(0) {
+    // Load selector
+    0x00 calldataload 0xe0 shr      // [selector]
+    
+    // name() = 0x06fdde03
+    dup1 0x06fdde03 eq name jumpi
+    
+    // decimals() = 0x313ce567
+    dup1 0x313ce567 eq decimals jumpi
+    
+    // fallback: revert
+    0x00 0x00 revert
+    
+    name:
+        pop
+        // Return ABI-encoded "LIQ"
+        0x20 0x00 mstore             // offset = 32
+        0x03 0x20 mstore             // length = 3
+        0x4c49510000000000000000000000000000000000000000000000000000000000
+        0x40 mstore                  // "LIQ"
+        0x60 0x00 return
+    
+    decimals:
+        pop
+        0x06 0x00 mstore             // decimals = 6
+        0x20 0x00 return
+}
